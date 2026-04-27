@@ -54,6 +54,11 @@ vcpkg install libzupt:x64-linux
 # ou
 vcpkg install libzupt:x64-windows
 ```
+ ### Install via package
+
+<img width="1080" height="235" alt="image" src="https://github.com/user-attachments/assets/2d8adeaa-5e7b-4bd0-964b-7fbb516fba08" />
+
+https://software.opensuse.org/download.html?project=home%3Acabelo&package=libzupt
 
 ## Basic Usage
 
