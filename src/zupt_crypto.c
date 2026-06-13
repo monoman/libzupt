@@ -21,6 +21,11 @@
   #include <sys/syscall.h>
   #include <unistd.h>
 #endif
+#if !defined(_WIN32)
+  #include <fcntl.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  * RANDOM BYTES (OS-native CSPRNG — NO FALLBACK)
@@ -452,9 +457,19 @@ int zupt_hybrid_keygen(const char *keyfile) {
     zupt_random_bytes(x_sk, 32);
     zupt_x25519_base(x_pk, x_sk);
 
-    /* Write private key file */
+    /* Write private key file. The file holds the X25519 and ML-KEM secret
+     * keys in the clear, so it must never be world/group readable. Create it
+     * with 0600 atomically (via open) rather than fopen + chmod, which would
+     * briefly expose the file with the umask-default mode. */
+#if !defined(_WIN32)
+    int fd = open(keyfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); return -1; }
+#else
     FILE *f = fopen(keyfile, "wb");
     if (!f) return -1;
+#endif
 
     size_t total = ZKEY_PRIV_SIZE;
     uint8_t *buf = (uint8_t *)calloc(total + 8, 1); /* +8 for checksum */
@@ -552,6 +567,29 @@ static int read_privkey(const char *path, uint8_t ml_pk[1184], uint8_t x_pk[32],
     return 0;
 }
 
+/* Parse a public key directly from an in-memory buffer (no temp files). */
+static int parse_pubkey_buf(const uint8_t *buf, size_t len,
+                            uint8_t ml_pk[1184], uint8_t x_pk[32]) {
+    if (!buf || len < (size_t)(8 + 1184 + 32)) return -1;
+    if (memcmp(buf, ZKEY_MAGIC, 4) != 0) return -1;
+    memcpy(ml_pk, buf + 8, 1184);
+    memcpy(x_pk, buf + 8 + 1184, 32);
+    return 0;
+}
+
+/* Parse a private key directly from an in-memory buffer (no temp files). */
+static int parse_privkey_buf(const uint8_t *buf, size_t len,
+                             uint8_t ml_pk[1184], uint8_t x_pk[32],
+                             uint8_t ml_sk[2400], uint8_t x_sk[32]) {
+    if (!buf || len < (size_t)(8 + 1184 + 32 + 2400 + 32)) return -1;
+    if (memcmp(buf, ZKEY_MAGIC, 4) != 0 || !(buf[5] & ZKEY_FLAG_PRIVATE)) return -1;
+    memcpy(ml_pk, buf + 8, 1184);
+    memcpy(x_pk, buf + 8 + 1184, 32);
+    memcpy(ml_sk, buf + 8 + 1184 + 32, 2400);
+    memcpy(x_sk, buf + 8 + 1184 + 32 + 2400, 32);
+    return 0;
+}
+
 /*
  * HYBRID ENCRYPT INIT: Encapsulate with ML-KEM + X25519, derive archive keys.
  *
@@ -576,11 +614,11 @@ static int read_privkey(const char *path, uint8_t ml_pk[1184], uint8_t x_pk[32],
   @ ensures \result == 0 ==> kr->active == 1;
   @ ensures \result == 0 ==> *enc_hdr_len == 1137;
 */
-int zupt_hybrid_encrypt_init(zupt_keyring_t *kr, const char *pubkeyfile,
-                              uint8_t *enc_hdr, size_t *enc_hdr_len) {
-    uint8_t ml_pk[1184], x_pk[32];
-    if (read_pubkey(pubkeyfile, ml_pk, x_pk) != 0) return -1;
-
+/* Shared encapsulation + KDF core, used by both the file- and memory-based
+ * encrypt-init entry points. Takes the already-parsed recipient public keys. */
+static int hybrid_encrypt_core(zupt_keyring_t *kr,
+                               const uint8_t ml_pk[1184], const uint8_t x_pk[32],
+                               uint8_t *enc_hdr, size_t *enc_hdr_len) {
     /* ML-KEM-768 encapsulation */
     uint8_t ml_ct[1088], ml_ss[32];
     if (zupt_mlkem768_encaps(ml_ct, ml_ss, ml_pk) != 0) return -1;
@@ -637,6 +675,21 @@ int zupt_hybrid_encrypt_init(zupt_keyring_t *kr, const char *pubkeyfile,
     return 0;
 }
 
+int zupt_hybrid_encrypt_init(zupt_keyring_t *kr, const char *pubkeyfile,
+                              uint8_t *enc_hdr, size_t *enc_hdr_len) {
+    uint8_t ml_pk[1184], x_pk[32];
+    if (read_pubkey(pubkeyfile, ml_pk, x_pk) != 0) return -1;
+    return hybrid_encrypt_core(kr, ml_pk, x_pk, enc_hdr, enc_hdr_len);
+}
+
+int zupt_hybrid_encrypt_init_mem(zupt_keyring_t *kr,
+                                  const uint8_t *pubkey, size_t pubkey_len,
+                                  uint8_t *enc_hdr, size_t *enc_hdr_len) {
+    uint8_t ml_pk[1184], x_pk[32];
+    if (parse_pubkey_buf(pubkey, pubkey_len, ml_pk, x_pk) != 0) return -1;
+    return hybrid_encrypt_core(kr, ml_pk, x_pk, enc_hdr, enc_hdr_len);
+}
+
 /*
  * HYBRID DECRYPT INIT: Decapsulate with ML-KEM + X25519, derive archive keys.
  */
@@ -649,17 +702,18 @@ int zupt_hybrid_encrypt_init(zupt_keyring_t *kr, const char *pubkeyfile,
   @         kr->iterations, kr->active;
   @ ensures \result == 0 ==> kr->active == 1;
 */
-int zupt_hybrid_decrypt_init(zupt_keyring_t *kr, const char *privkeyfile,
-                              const uint8_t *enc_hdr, size_t enc_hdr_len) {
+/* Shared decapsulation + KDF core, used by both the file- and memory-based
+ * decrypt-init entry points. Takes the already-parsed recipient secret keys;
+ * the caller owns and wipes ml_sk/x_sk. */
+static int hybrid_decrypt_core(zupt_keyring_t *kr,
+                               const uint8_t ml_sk[2400], const uint8_t x_sk[32],
+                               const uint8_t *enc_hdr, size_t enc_hdr_len) {
     if (enc_hdr_len < 1 + 1088 + 32 + 16) return -1;  /* enc_type + ct + eph_pk + nonce */
     if (enc_hdr[0] != ZUPT_ENC_PQ_HYBRID) return -1;
 
     const uint8_t *ml_ct  = enc_hdr + 1;
     const uint8_t *eph_pk = enc_hdr + 1 + 1088;
     const uint8_t *nonce  = enc_hdr + 1 + 1088 + 32;
-
-    uint8_t ml_pk[1184], x_pk[32], ml_sk[2400], x_sk[32];
-    if (read_privkey(privkeyfile, ml_pk, x_pk, ml_sk, x_sk) != 0) return -1;
 
     /* ML-KEM-768 decapsulation */
     uint8_t ml_ss[32];
@@ -694,8 +748,6 @@ int zupt_hybrid_decrypt_init(zupt_keyring_t *kr, const char *privkeyfile,
     zupt_mlock_keys(kr->enc_key, ZUPT_AES_KEY_SIZE);
     zupt_mlock_keys(kr->mac_key, ZUPT_HMAC_SIZE);
 
-    zupt_secure_wipe(ml_sk, sizeof(ml_sk));
-    zupt_secure_wipe(x_sk, 32);
     zupt_secure_wipe(ml_ss, 32);
     zupt_secure_wipe(x_ss, 32);
     zupt_secure_wipe(hybrid_ikm, 32);
@@ -703,4 +755,25 @@ int zupt_hybrid_decrypt_init(zupt_keyring_t *kr, const char *privkeyfile,
     zupt_secure_wipe(archive_key, 64);
 
     return 0;
+}
+
+int zupt_hybrid_decrypt_init(zupt_keyring_t *kr, const char *privkeyfile,
+                              const uint8_t *enc_hdr, size_t enc_hdr_len) {
+    uint8_t ml_pk[1184], x_pk[32], ml_sk[2400], x_sk[32];
+    if (read_privkey(privkeyfile, ml_pk, x_pk, ml_sk, x_sk) != 0) return -1;
+    int r = hybrid_decrypt_core(kr, ml_sk, x_sk, enc_hdr, enc_hdr_len);
+    zupt_secure_wipe(ml_sk, sizeof(ml_sk));
+    zupt_secure_wipe(x_sk, 32);
+    return r;
+}
+
+int zupt_hybrid_decrypt_init_mem(zupt_keyring_t *kr,
+                                  const uint8_t *privkey, size_t privkey_len,
+                                  const uint8_t *enc_hdr, size_t enc_hdr_len) {
+    uint8_t ml_pk[1184], x_pk[32], ml_sk[2400], x_sk[32];
+    if (parse_privkey_buf(privkey, privkey_len, ml_pk, x_pk, ml_sk, x_sk) != 0) return -1;
+    int r = hybrid_decrypt_core(kr, ml_sk, x_sk, enc_hdr, enc_hdr_len);
+    zupt_secure_wipe(ml_sk, sizeof(ml_sk));
+    zupt_secure_wipe(x_sk, 32);
+    return r;
 }

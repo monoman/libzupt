@@ -9,121 +9,9 @@
 #include "zupt.h"
 #include "zupt_mlkem.h"
 #include "zupt_x25519.h"
-#include "zupt_keccak.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-
-#ifdef _WIN32
-#include <process.h>
-#include <io.h>
-#define getpid _getpid
-#define unlink _unlink
-#endif
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * HYBRID KEY DERIVATION
- * ═══════════════════════════════════════════════════════════════════ */
-
-int zupt_hybrid_derive_keys(const uint8_t* ml_ss, const uint8_t* ml_ct,
-                            const uint8_t* eph_pk, const uint8_t* ml_pk,
-                            uint8_t* archive_key) {
-    if (!ml_ss || !ml_ct || !eph_pk || !archive_key) return -1;
-
-    /* Compute hybrid shared secret: XOR ML-KEM and X25519 shared secrets */
-    uint8_t hybrid_ikm[32];
-    for (int i = 0; i < 32; i++) {
-        hybrid_ikm[i] = ml_ss[i];
-    }
-
-    /* Key derivation:
-     * archive_key = SHA3-512(hybrid_ikm || ml_ct || eph_pk || "ZUPT-HYBRID-v1")
-     * Output: enc_key[32] + mac_key[32]
-     */
-    uint8_t kdf_input[ZUPT_KDF_INPUT_MAX];
-    size_t pos = 0;
-
-    memcpy(kdf_input + pos, hybrid_ikm, 32);
-    pos += 32;
-
-    memcpy(kdf_input + pos, ml_ct, 1088);
-    pos += 1088;
-
-    memcpy(kdf_input + pos, eph_pk, 32);
-    pos += 32;
-
-    memcpy(kdf_input + pos, "ZUPT-HYBRID-v1", 15);
-    pos += 15;
-
-    /* Compute SHA3-512 */
-    zupt_sha3_512(kdf_input, pos, archive_key);
-
-    /* Wipe sensitive data */
-    zupt_secure_wipe(hybrid_ikm, sizeof(hybrid_ikm));
-    zupt_secure_wipe(kdf_input, pos);
-
-    return 0;
-}
-
-int zupt_hybrid_decrypt_derive_keys(const uint8_t* priv_key, size_t priv_key_len,
-                                    const uint8_t* enc_header, size_t enc_header_len,
-                                    uint8_t* archive_key) {
-    /* Parse private key: ZKEY header (8) + ml_pk(1184) + x_pk(32) + ml_sk(2400) + x_sk(32) */
-    if (priv_key_len < 8 + 1184 + 32 + 2400 + 32) return -1;
-    if (enc_header_len < 1 + 1088 + 32 + 16) return -1;
-
-    const uint8_t* ml_pk = priv_key + 8;
-    const uint8_t* x_pk = ml_pk + 1184;
-    const uint8_t* ml_sk = x_pk + 32;
-    const uint8_t* x_sk = ml_sk + 2400;
-
-    /* Parse encryption header: enc_type(1) + ml_ct(1088) + eph_pk(32) + nonce(16) */
-    const uint8_t* ml_ct = enc_header + 1;
-    const uint8_t* eph_pk = ml_ct + 1088;
-
-    /* ML-KEM decapsulation */
-    uint8_t ml_ss[32];
-    if (zupt_mlkem768_decaps(ml_ss, ml_ct, ml_sk) != 0) {
-        return -1;
-    }
-
-    /* X25519 ECDH */
-    uint8_t x_ss[32];
-    zupt_x25519(x_ss, x_sk, eph_pk);
-
-    /* Hybrid shared secret */
-    uint8_t hybrid_ikm[32];
-    for (int i = 0; i < 32; i++) {
-        hybrid_ikm[i] = ml_ss[i] ^ x_ss[i];
-    }
-
-    /* Key derivation */
-    uint8_t kdf_input[ZUPT_KDF_INPUT_MAX];
-    size_t pos = 0;
-
-    memcpy(kdf_input + pos, hybrid_ikm, 32);
-    pos += 32;
-
-    memcpy(kdf_input + pos, ml_ct, 1088);
-    pos += 1088;
-
-    memcpy(kdf_input + pos, eph_pk, 32);
-    pos += 32;
-
-    memcpy(kdf_input + pos, "ZUPT-HYBRID-v1", 15);
-    pos += 15;
-
-    zupt_sha3_512(kdf_input, pos, archive_key);
-
-    /* Wipe sensitive data */
-    zupt_secure_wipe(ml_ss, sizeof(ml_ss));
-    zupt_secure_wipe(x_ss, sizeof(x_ss));
-    zupt_secure_wipe(hybrid_ikm, sizeof(hybrid_ikm));
-    zupt_secure_wipe(kdf_input, pos);
-
-    return 0;
-}
 
 /* ═══════════════════════════════════════════════════════════════════
  * KEY GENERATION
@@ -271,36 +159,11 @@ uint8_t* zupt_hybrid_encrypt(const uint8_t* pub_key, size_t pub_key_len,
         return NULL;
     }
 
-    /* Create temporary public key file */
-    FILE* tmp = tmpfile();
-    if (!tmp) return NULL;
-
-    if (fwrite(pub_key, 1, pub_key_len, tmp) != pub_key_len) {
-        fclose(tmp);
-        return NULL;
-    }
-    rewind(tmp);
-
-    /* Read public key file path via temp file descriptor */
-    char tmp_path[64];
-    snprintf(tmp_path, sizeof(tmp_path), "/tmp/zupt_pub_XXXXXX");
-
-    /* Actually, let's use a different approach - write to a temp file by name */
-    snprintf(tmp_path, sizeof(tmp_path), "/tmp/zupt_pub_%d", getpid());
-    FILE* f = fopen(tmp_path, "wb");
-    if (!f) {
-        fclose(tmp);
-        return NULL;
-    }
-    fwrite(pub_key, 1, pub_key_len, f);
-    fclose(f);
-    fclose(tmp);
-
-    /* Initialize hybrid encryption */
+    /* Initialize hybrid encryption directly from the in-memory public key.
+     * No key material is ever written to disk. */
     zupt_keyring_t kr = {};
-    int ret = zupt_hybrid_encrypt_init(&kr, tmp_path, enc_header, enc_header_len);
-    unlink(tmp_path);
-
+    int ret = zupt_hybrid_encrypt_init_mem(&kr, pub_key, pub_key_len,
+                                           enc_header, enc_header_len);
     if (ret != 0) {
         return NULL;
     }
@@ -374,24 +237,12 @@ uint8_t* zupt_hybrid_decrypt(const uint8_t* priv_key, size_t priv_key_len,
         return NULL;
     }
 
-    /* Create temporary private key file */
-    char tmp_path[64];
-    snprintf(tmp_path, sizeof(tmp_path), "/tmp/zupt_priv_%d", getpid());
-    FILE* f = fopen(tmp_path, "wb");
-    if (!f) return NULL;
-
-    if (fwrite(priv_key, 1, priv_key_len, f) != priv_key_len) {
-        fclose(f);
-        unlink(tmp_path);
-        return NULL;
-    }
-    fclose(f);
-
-    /* Initialize hybrid decryption */
+    /* Initialize hybrid decryption directly from the in-memory private key.
+     * The secret key is never staged on disk (which would defeat the
+     * in-RAM mlock protection and leave key material in /tmp). */
     zupt_keyring_t kr = {};
-    int ret = zupt_hybrid_decrypt_init(&kr, tmp_path, enc_header, enc_header_len);
-    unlink(tmp_path);
-
+    int ret = zupt_hybrid_decrypt_init_mem(&kr, priv_key, priv_key_len,
+                                           enc_header, enc_header_len);
     if (ret != 0) {
         return NULL;
     }
@@ -410,11 +261,14 @@ uint8_t* zupt_hybrid_decrypt(const uint8_t* priv_key, size_t priv_key_len,
             return NULL;
         }
 
-        /* Read payload length from ciphertext (little-endian) */
-        size_t block_len = ciphertext[pos] |
-                          (ciphertext[pos + 1] << 8) |
-                          (ciphertext[pos + 2] << 16) |
-                          (ciphertext[pos + 3] << 24);
+        /* Read payload length from ciphertext (little-endian).
+         * Cast to uint32_t before shifting: a bare uint8_t promotes to int,
+         * so `byte << 24` is undefined/sign-extends when the top bit is set,
+         * which would yield a bogus (huge) block_len. */
+        size_t block_len = (size_t)ciphertext[pos] |
+                          ((size_t)ciphertext[pos + 1] << 8) |
+                          ((size_t)ciphertext[pos + 2] << 16) |
+                          ((size_t)ciphertext[pos + 3] << 24);
 
         if (block_len == 0) break;
 

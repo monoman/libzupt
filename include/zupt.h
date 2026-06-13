@@ -324,6 +324,14 @@ int zupt_hybrid_encrypt_init(zupt_keyring_t *kr, const char *pubkeyfile,
                               uint8_t *enc_hdr, size_t *enc_hdr_len);
 int zupt_hybrid_decrypt_init(zupt_keyring_t *kr, const char *privkeyfile,
                               const uint8_t *enc_hdr, size_t enc_hdr_len);
+/* In-memory variants: take the key material directly from a buffer instead of
+ * a file path, so callers never have to stage (private) keys on disk. */
+int zupt_hybrid_encrypt_init_mem(zupt_keyring_t *kr,
+                                  const uint8_t *pubkey, size_t pubkey_len,
+                                  uint8_t *enc_hdr, size_t *enc_hdr_len);
+int zupt_hybrid_decrypt_init_mem(zupt_keyring_t *kr,
+                                  const uint8_t *privkey, size_t privkey_len,
+                                  const uint8_t *enc_hdr, size_t enc_hdr_len);
 
 const char *zupt_strerror(zupt_error_t e);
 const char *zupt_codec_name(uint16_t id);

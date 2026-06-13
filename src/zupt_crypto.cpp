@@ -12,6 +12,12 @@
 #include <fstream>
 #include <stdexcept>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 // Include C implementation headers
 extern "C" {
 #include "zupt.h"
@@ -183,7 +189,19 @@ void KeyGenerator::exportPublicKey(const std::string& privfile, const std::strin
 }
 
 void KeyGenerator::saveKeyPair(const KeyPair& kp, const std::string& filename) {
-    std::ofstream file(filename, std::ios::binary);
+    /* The key pair file contains the private key in the clear, so restrict it
+     * to owner-only (0600) before writing any secret bytes. ofstream offers no
+     * way to set the mode, so create/tighten the file first via open()+fchmod. */
+#if !defined(_WIN32)
+    int fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        throw ZuptError(ErrorCode::ERR_IO, "Cannot create key file: " + filename);
+    }
+    ::fchmod(fd, 0600);  /* enforce 0600 even if the file already existed */
+    ::close(fd);
+#endif
+
+    std::ofstream file(filename, std::ios::binary | std::ios::trunc);
     if (!file) {
         throw ZuptError(ErrorCode::ERR_IO, "Cannot create key file: " + filename);
     }
