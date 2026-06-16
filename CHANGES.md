@@ -1,5 +1,26 @@
 # Histórico de Alterações do libzupt
 
+## Não lançado
+
+### Segurança
+- Chaves não são mais gravadas em arquivos temporários previsíveis em `/tmp`
+  durante a criptografia/descriptografia em memória. As funções de
+  criptografia/descriptografia agora derivam as chaves diretamente do buffer
+  em memória (`zupt_hybrid_encrypt_init_mem` / `zupt_hybrid_decrypt_init_mem`),
+  eliminando um vetor de ataque por symlink e o vazamento da chave privada em
+  disco (que anulava a proteção `mlock`).
+- Arquivos de chave privada gerados agora são criados com permissões `0600`
+  (somente o dono), tanto na API C (`zupt_hybrid_keygen`) quanto na API C++
+  (`KeyGenerator::saveKeyPair`), em vez de herdar o modo padrão do `umask`.
+
+### Correções
+- Corrigida extensão de sinal/comportamento indefinido na leitura do tamanho
+  do bloco durante a descriptografia: cada byte é convertido para `size_t`
+  antes do deslocamento, evitando um `block_len` inválido (enorme).
+- Removidas as funções mortas e incorretas `zupt_hybrid_derive_keys` (que
+  ignorava o segredo X25519, produzindo chaves que o lado de descriptografia
+  nunca reproduziria) e `zupt_hybrid_decrypt_derive_keys`, ambas sem uso.
+
 ## v1.5.0 (2026-03-29)
 
 ### Novidades

@@ -31,26 +31,6 @@
 extern "C" {
 #endif
 
-/* HYBRID KEY DERIVATION C API */
-
-/* Maximum key derivation input size */
-#define ZUPT_KDF_INPUT_MAX (32 + 1088 + 32 + 15)
-
-/* Derive archive keys from hybrid shared secret and transcript
- * Returns 64 bytes: enc_key[32] + mac_key[32]
- * Returns 0 on success, -1 on error
- */
-ZUPT_API int zupt_hybrid_derive_keys(const uint8_t* ml_ss, const uint8_t* ml_ct,
-                                     const uint8_t* eph_pk, const uint8_t* ml_pk,
-                                     uint8_t* archive_key);
-
-/* Derive archive keys from private key and encryption header
- * Returns 0 on success, -1 on error
- */
-ZUPT_API int zupt_hybrid_decrypt_derive_keys(const uint8_t* priv_key, size_t priv_key_len,
-                                             const uint8_t* enc_header, size_t enc_header_len,
-                                             uint8_t* archive_key);
-
 /* KEY GENERATION C API */
 
 /* Generate a hybrid key pair
